@@ -1,3 +1,4 @@
 streamlit
 supabase
 langchain-groq
+deep-translator
