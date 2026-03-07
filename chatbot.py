@@ -30,7 +30,7 @@ llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama-3.3-70b-versatile")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ------------------------------------------------
-# TABLE SCHEMA (both tables)
+# TABLE SCHEMA
 # ------------------------------------------------
 TABLE_SCHEMA = """
 PRIMARY TABLE: naukri_jobs
@@ -359,8 +359,8 @@ Rules:
 4. If no tool fits AND DB data is needed → use run_custom_sql with valid PostgreSQL SELECT
 5. For general knowledge or advice → use general_advice
 6. You can call multiple tools
-7. When user says "at most N" or "limit N" or "show me N" → pass limit as integer in params
-8. Never pass limit as a string — always integer e.g. 10 not "10"
+7. When user says "at most N" or "limit N" or "show me N" → pass limit as integer
+8. Never pass limit as string — always integer e.g. 10 not "10"
 
 Respond ONLY with a JSON array. No markdown, no explanation:
 [
@@ -400,7 +400,7 @@ def execute_tool_calls(tool_calls):
     return results
 
 
-def generate_final_answer(user_question, tool_results, chat_history):
+def generate_final_answer(user_question, tool_results, chat_history, is_hindi=False):
     results_str = ""
     for r in tool_results:
         results_str += f"\n[Tool: {r['tool']} | Reason: {r['reason']}]\n"
@@ -411,6 +411,13 @@ def generate_final_answer(user_question, tool_results, chat_history):
     for msg in (chat_history or [])[-4:]:
         role = "User" if msg["role"] == "user" else "Assistant"
         history_str += f"{role}: {msg['content'][:300]}\n"
+
+    # ✅ Force Hindi reply if user asked in Hindi
+    language_instruction = (
+        "IMPORTANT: The user asked in Hindi. You MUST respond entirely in Hindi. Use Hindi script."
+        if is_hindi else
+        "Respond in English."
+    )
 
     answer_prompt = f"""You are an expert career advisor with access to real Indian job market data.
 
@@ -428,8 +435,8 @@ Instructions:
 - If data is empty or has errors, say so and answer from general knowledge
 - Be conversational, not robotic
 - Use bullet points or tables where helpful
-- If user asked in Hindi, respond in Hindi
 - Keep it concise but complete
+- {language_instruction}
 """
     try:
         response = llm.invoke(answer_prompt)
@@ -500,12 +507,13 @@ if prompt := st.chat_input("Ask anything about jobs, skills, salaries, risk...")
     st.session_state.messages.append({"role": "user", "content": prompt})
     st.chat_message("user").write(prompt)
 
-    original_prompt = prompt
-    processing_prompt = translate_to_english(prompt)
+    # ✅ Detect Hindi BEFORE translating
+    is_hindi = bool(re.search("[\u0900-\u097F]", prompt))
+    processing_prompt = translate_to_english(prompt) if is_hindi else prompt
 
-    if processing_prompt != original_prompt:
+    if is_hindi:
         with st.sidebar:
-            st.info(f"🌐 Translated: *{processing_prompt}*")
+            st.info(f"🌐 Translated for processing: *{processing_prompt}*")
 
     with st.spinner("🧠 Thinking..."):
         tool_calls = plan_tool_call(processing_prompt, st.session_state.messages[:-1])
@@ -520,10 +528,13 @@ if prompt := st.chat_input("Ask anything about jobs, skills, salaries, risk...")
                 st.divider()
 
         tool_results = execute_tool_calls(tool_calls)
+
+        # ✅ Pass is_hindi flag so reply language matches input language
         answer = generate_final_answer(
             processing_prompt,
             tool_results,
-            st.session_state.messages[:-1]
+            st.session_state.messages[:-1],
+            is_hindi=is_hindi
         )
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
