@@ -30,91 +30,12 @@ llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama-3.3-70b-versatile")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ================================================
-# SUPABASE AUTH — iframe postMessage token receiver
-#
-# Flow:
-#   1. Next.js parent reads the Supabase session from its own client
-#   2. Parent postMessages { access_token, refresh_token, user_id, email }
-#      into this iframe on load
-#   3. A small JS snippet (injected via st.components) catches the message
-#      and writes the token into the iframe URL as ?sb_token=<access_token>
-#      triggering a Streamlit rerun
-#   4. Python reads the token from query params, calls get_user() to verify
-#      it server-side, and stores the real user UUID
-#   5. On every subsequent rerun, user_id is already in st.session_state
-#      so none of this runs again
+# SUPABASE AUTH — URL token gate
 # ================================================
-
-import streamlit.components.v1 as components
-
-# ── Step 1: Inject the JS postMessage listener ───────────────────────────────
-# This runs on every page load but is a no-op once user_id is set.
-# The JS listens for a message from the parent Next.js window, then
-# reloads the iframe URL with ?sb_token=<token> appended.
-# We use a unique type "SUPABASE_AUTH" to avoid reacting to other messages.
 
 TOKEN_PARAM = "sb_token"
 
-def inject_postmessage_listener():
-    """
-    Inject a JS snippet that:
-    - Listens for postMessage from parent with type SUPABASE_AUTH
-    - On receipt, appends ?sb_token=<access_token> to the iframe URL
-      which triggers Streamlit to rerun and lets Python read it
-    - Also immediately requests the token from the parent (in case
-      the message already fired before the listener was ready)
-    """
-    components.html(
-        """
-        <script>
-        (function() {
-            // Avoid registering multiple listeners on reruns
-            if (window._sbAuthListenerRegistered) return;
-            window._sbAuthListenerRegistered = true;
-
-            function applyToken(token) {
-                // Only redirect if token not already in URL
-                const url = new URL(window.location.href);
-                if (!url.searchParams.get('sb_token')) {
-                    url.searchParams.set('sb_token', token);
-                    // Replace so the token param doesn't stack up in history
-                    window.location.replace(url.toString());
-                }
-            }
-
-            window.addEventListener('message', function(event) {
-                // Security: only accept messages from your Next.js origin.
-                // IMPORTANT — replace this with your actual production domain.
-                const ALLOWED_ORIGINS = [
-                    'http://localhost:3000',
-                    'https://your-app.vercel.app',   // ← replace with real domain
-                ];
-                if (!ALLOWED_ORIGINS.includes(event.origin)) return;
-
-                if (event.data && event.data.type === 'SUPABASE_AUTH') {
-                    const token = event.data.access_token;
-                    if (token) applyToken(token);
-                }
-            });
-
-            // Ask the parent to re-send the token in case it was sent
-            // before this listener was registered (common on first load)
-            if (window.parent !== window) {
-                window.parent.postMessage({ type: 'REQUEST_SUPABASE_TOKEN' }, '*');
-            }
-        })();
-        </script>
-        """,
-        height=0,
-    )
-
 def verify_token_and_set_user(access_token: str) -> tuple:
-    """
-    Verify the access_token server-side by calling supabase.auth.get_user().
-    Returns (user_id, email) or raises on failure.
-    This is the critical security step — we never trust a token without
-    verifying it against Supabase.
-    """
     try:
         res = supabase.auth.get_user(access_token)
         if res and res.user:
@@ -123,36 +44,23 @@ def verify_token_and_set_user(access_token: str) -> tuple:
     except Exception as e:
         raise ValueError(f"Token verification failed: {e}")
 
-# ── Auth gate ─────────────────────────────────────────────────────────────────
-
 if "user_id" not in st.session_state:
-
-    # Check if the postMessage listener already wrote a token into the URL
-    token_from_url = st.query_params.get(TOKEN_PARAM)
-
+    token_from_url = st.query_params.get(TOKEN_PARAM, "").strip()
     if token_from_url:
-        # Verify token server-side and extract real user UUID
         try:
             uid, email = verify_token_and_set_user(token_from_url)
             st.session_state.user_id = uid
             st.session_state.user_email = email
-            # Remove the token from the URL immediately for cleanliness
-            # (it's already stored in session_state, no need to keep it visible)
             st.query_params.clear()
+            st.query_params["embed"] = "true"
             st.rerun()
         except ValueError as e:
-            # Token was present but invalid — show error and wait for parent
-            st.set_page_config(page_title="Career AI", page_icon="💼")
             st.error(f"❌ Authentication failed: {e}")
-            st.info("Please return to the main app and try again.")
-            inject_postmessage_listener()
+            st.info("Please close this panel and reopen it from the main app.")
             st.stop()
     else:
-        # No token yet — inject listener and wait for parent to postMessage it
-        st.set_page_config(page_title="Career AI", page_icon="💼")
-        st.title("💼 Career Intelligence Chatbot")
-        st.info("⏳ Authenticating with your session...")
-        inject_postmessage_listener()
+        st.warning("⏳ No auth token received. Please close and reopen the chatbot panel.")
+        st.info("If this keeps happening, your session may have expired. Try logging out and back in.")
         st.stop()
 
 # ── Authenticated header ──────────────────────────────────────────────────────
@@ -199,44 +107,28 @@ def save_chat(role, message):
         print("Chat save error:", e)
 
 # ------------------------------------------------
-# LOADING CHAT HISTORY — Fixed ordering bug
+# LOADING CHAT HISTORY
 # ------------------------------------------------
 def load_chat_history():
-    """
-    Load last 20 messages in correct chronological order.
-    Bug fix: previously used desc + Python reverse which still
-    returned the LATEST 20 rows (wrong). Now we use a subquery
-    approach: fetch desc (gets newest first), then reverse in Python
-    — but LIMIT must happen AFTER ordering so we get the true last 20.
-    """
     try:
-        # Fetch most recent 20 rows (newest first), then reverse for chronological display
         res = supabase.table("chat_history") \
             .select("role, message, created_at") \
             .eq("user_id", st.session_state.user_id) \
             .order("created_at", desc=True) \
             .limit(20) \
             .execute()
-
         if not res.data:
             return []
-
-        # Reverse to get chronological order (oldest → newest)
         data = list(reversed(res.data))
         return [{"role": r["role"], "content": r["message"]} for r in data]
-
     except Exception as e:
         print("Chat load error:", e)
         return []
 
 # ------------------------------------------------
-# BUILD HISTORY STRING FOR LLM — No truncation of content
+# BUILD HISTORY STRING FOR LLM
 # ------------------------------------------------
 def build_history_str(chat_history, max_messages=10, max_chars_per_msg=600):
-    """
-    Build a conversation history string for LLM prompts.
-    Uses last `max_messages` messages with reasonable per-message limit.
-    """
     if not chat_history:
         return ""
     history_str = ""
@@ -250,17 +142,20 @@ def build_history_str(chat_history, max_messages=10, max_chars_per_msg=600):
     return history_str.strip()
 
 # ================================================
-# RAG SECTION
+# RAG SECTION — Dual vector store (naukri_jobs + jobs)
 # ================================================
 
 @st.cache_resource
 def load_embedding_model():
-    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_huggingface import HuggingFaceEmbeddings
     return HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
         model_kwargs={"device": "cpu"}
     )
 
+# ------------------------------------------------
+# naukri_jobs embeddings (table: job_embeddings, pk: id)
+# ------------------------------------------------
 def save_embeddings_to_supabase(jobs, embedding_model):
     try:
         existing_ids = set()
@@ -335,6 +230,7 @@ Rating: {job.get('stars', 'N/A')}""".strip()
         return f"Error: {str(e)}"
 
 def load_embeddings_from_supabase(embedding_model):
+    """Load naukri_jobs embeddings from job_embeddings table into a FAISS store."""
     try:
         from langchain_community.vectorstores import FAISS
 
@@ -346,7 +242,7 @@ def load_embeddings_from_supabase(embedding_model):
         chunk_size = 500
         offset = 0
         vector_store = None
-        progress = st.progress(0, text="Loading embeddings from Supabase...")
+        progress = st.progress(0, text="Loading naukri embeddings...")
 
         while offset < total:
             res = supabase.table("job_embeddings").select("*")\
@@ -365,6 +261,7 @@ def load_embeddings_from_supabase(embedding_model):
                 embedding = [float(x) for x in embedding]
                 chunk_text_embeddings.append((row["page_content"], embedding))
                 chunk_metadatas.append({
+                    "source": "naukri_jobs",
                     "jobtitle": row.get("jobtitle", ""),
                     "company": row.get("company", ""),
                     "location": row.get("location", ""),
@@ -388,7 +285,7 @@ def load_embeddings_from_supabase(embedding_model):
             offset += chunk_size
             progress.progress(
                 min(offset / total, 1.0),
-                text=f"Loading... {min(offset, total)}/{total}"
+                text=f"Loading naukri... {min(offset, total)}/{total}"
             )
 
         progress.empty()
@@ -397,54 +294,162 @@ def load_embeddings_from_supabase(embedding_model):
     except Exception as e:
         return None, str(e)
 
+# ------------------------------------------------
+# jobs table embeddings (table: job_static_embeddings, pk: jobid)
+# ------------------------------------------------
+def load_static_embeddings_from_supabase(embedding_model):
+    """Load jobs table embeddings from job_static_embeddings into a FAISS store."""
+    try:
+        from langchain_community.vectorstores import FAISS
+
+        count_res = supabase.table("job_static_embeddings").select("jobid", count="exact").execute()
+        total = count_res.count or 0
+        if total == 0:
+            return None, 0
+
+        chunk_size = 500
+        offset = 0
+        vector_store = None
+        progress = st.progress(0, text="Loading jobs embeddings...")
+
+        while offset < total:
+            res = supabase.table("job_static_embeddings").select("*")\
+                .range(offset, offset + chunk_size - 1).execute()
+            chunk = res.data or []
+            if not chunk:
+                break
+
+            chunk_text_embeddings = []
+            chunk_metadatas = []
+
+            for row in chunk:
+                embedding = row["embedding"]
+                if isinstance(embedding, str):
+                    embedding = json.loads(embedding)
+                embedding = [float(x) for x in embedding]
+                chunk_text_embeddings.append((row["page_content"], embedding))
+                # Include richer metadata from jobs table for display
+                chunk_metadatas.append({
+                    "source": "jobs",
+                    "jobtitle": row.get("jobtitle", ""),
+                    "company": row.get("company", ""),
+                    "location": row.get("joblocation_address", ""),
+                    "skills": row.get("skills", ""),
+                    "industry": row.get("industry", ""),
+                    "payrate": row.get("payrate", ""),
+                    "experience": row.get("experience", ""),
+                    "education": row.get("education", ""),
+                })
+
+            if vector_store is None:
+                vector_store = FAISS.from_embeddings(
+                    text_embeddings=chunk_text_embeddings,
+                    embedding=embedding_model,
+                    metadatas=chunk_metadatas
+                )
+            else:
+                chunk_store = FAISS.from_embeddings(
+                    text_embeddings=chunk_text_embeddings,
+                    embedding=embedding_model,
+                    metadatas=chunk_metadatas
+                )
+                vector_store.merge_from(chunk_store)
+
+            offset += chunk_size
+            progress.progress(
+                min(offset / total, 1.0),
+                text=f"Loading jobs... {min(offset, total)}/{total}"
+            )
+
+        progress.empty()
+        return vector_store, total
+
+    except Exception as e:
+        return None, str(e)
+
+# ------------------------------------------------
+# Combined vector store loader
+# ------------------------------------------------
 @st.cache_resource
 def get_vector_store():
+    """
+    Loads BOTH embedding tables and merges them into a single FAISS index.
+    Returns (merged_vector_store, counts_dict, status_string).
+    """
     try:
         embedding_model = load_embedding_model()
 
-        total_res = supabase.table("naukri_jobs").select("id", count="exact").execute()
-        total_jobs = total_res.count or 0
+        # ── naukri_jobs side ─────────────────────────────────────────────────
+        total_naukri_res = supabase.table("naukri_jobs").select("id", count="exact").execute()
+        total_naukri = total_naukri_res.count or 0
 
-        saved_res = supabase.table("job_embeddings").select("id", count="exact").execute()
-        total_saved = saved_res.count or 0
+        saved_naukri_res = supabase.table("job_embeddings").select("id", count="exact").execute()
+        total_naukri_saved = saved_naukri_res.count or 0
 
-        if total_saved >= total_jobs and total_saved > 0:
-            vector_store, result = load_embeddings_from_supabase(embedding_model)
-            if vector_store:
-                return vector_store, result, "loaded"
+        naukri_store = None
+        naukri_count = 0
 
-        all_jobs = []
-        page_size = 1000
-        offset = 0
-        while True:
-            res = supabase.table("naukri_jobs").select(
-                "id, jobtitle, company, location, skills, experience, stars"
-            ).range(offset, offset + page_size - 1).execute()
-            batch = res.data or []
-            if not batch:
-                break
-            all_jobs.extend(batch)
-            offset += page_size
-            if len(batch) < page_size:
-                break
-
-        if not all_jobs:
-            return None, 0, "no_data"
-
-        saved = save_embeddings_to_supabase(all_jobs, embedding_model)
-        if isinstance(saved, str):
-            return None, saved, "save_error"
-
-        vector_store, result = load_embeddings_from_supabase(embedding_model)
-        if vector_store:
-            return vector_store, result, "created"
+        if total_naukri_saved >= total_naukri and total_naukri_saved > 0:
+            # All naukri jobs already embedded — load directly
+            naukri_store, naukri_count = load_embeddings_from_supabase(embedding_model)
         else:
-            return None, result, "load_error"
+            # Some naukri jobs missing — fetch and embed them first
+            all_jobs = []
+            page_size = 1000
+            offset = 0
+            while True:
+                res = supabase.table("naukri_jobs").select(
+                    "id, jobtitle, company, location, skills, experience, stars"
+                ).range(offset, offset + page_size - 1).execute()
+                batch = res.data or []
+                if not batch:
+                    break
+                all_jobs.extend(batch)
+                offset += page_size
+                if len(batch) < page_size:
+                    break
+
+            if all_jobs:
+                saved = save_embeddings_to_supabase(all_jobs, embedding_model)
+                if not isinstance(saved, str):
+                    naukri_store, naukri_count = load_embeddings_from_supabase(embedding_model)
+
+        # ── jobs table (static) side ─────────────────────────────────────────
+        # job_static_embeddings is pre-generated offline (generate_jobs_embeddings.py)
+        # so we only load here — never generate inside the app.
+        static_store = None
+        static_count = 0
+
+        saved_static_res = supabase.table("job_static_embeddings").select("jobid", count="exact").execute()
+        total_static_saved = saved_static_res.count or 0
+
+        if total_static_saved > 0:
+            static_store, static_count = load_static_embeddings_from_supabase(embedding_model)
+
+        # ── Merge both stores ────────────────────────────────────────────────
+        if naukri_store and static_store:
+            # Merge static into naukri (in-place merge, naukri_store becomes combined)
+            naukri_store.merge_from(static_store)
+            combined_count = naukri_count + static_count
+            return naukri_store, {"naukri": naukri_count, "jobs": static_count, "total": combined_count}, "loaded_both"
+
+        elif naukri_store:
+            return naukri_store, {"naukri": naukri_count, "jobs": 0, "total": naukri_count}, "loaded_naukri_only"
+
+        elif static_store:
+            return static_store, {"naukri": 0, "jobs": static_count, "total": static_count}, "loaded_jobs_only"
+
+        else:
+            return None, {"naukri": 0, "jobs": 0, "total": 0}, "no_data"
 
     except Exception as e:
-        return None, str(e), "exception"
+        return None, {}, str(e)
 
-def rag_search(query, vector_store, k=5):
+def rag_search(query, vector_store, k=6):
+    """
+    Search the combined vector store. k=6 so we get a good mix from both sources.
+    Results already have source metadata ("naukri_jobs" or "jobs") set during load.
+    """
     try:
         return vector_store.similarity_search(query, k=k)
     except Exception:
@@ -492,7 +497,7 @@ Examples:
         return question
 
 # ------------------------------------------------
-# RAG ANSWER
+# RAG ANSWER — handles both naukri_jobs and jobs sources
 # ------------------------------------------------
 def rag_answer(question, vector_store, chat_history, is_hindi=False):
     rewritten_query = rewrite_query(question, chat_history)
@@ -502,10 +507,11 @@ def rag_answer(question, vector_store, chat_history, is_hindi=False):
         if relevant_docs else "No relevant jobs found."
 
     history_str = build_history_str(chat_history, max_messages=8)
-
     language = "IMPORTANT: Respond entirely in Hindi." if is_hindi else "Respond in English."
 
-    prompt = f"""You are an expert career advisor with access to real Indian job market data.
+    prompt = f"""You are an expert career advisor with access to real Indian job market data from two sources:
+- naukri_jobs: Indian job listings with ratings and location data
+- jobs: Detailed listings with salary (payrate), industry, education requirements, and full job descriptions
 
 CONVERSATION HISTORY:
 {history_str}
@@ -513,20 +519,21 @@ CONVERSATION HISTORY:
 ORIGINAL USER QUESTION: {question}
 SEARCH QUERY USED: {rewritten_query}
 
-RELEVANT JOB DATA (via semantic search):
+RELEVANT JOB DATA (via semantic search across both sources):
 {context}
 
 Instructions:
-- Format EACH job as a compact 3-line card exactly like this:
+- Format EACH job as a compact card:
 
 **1. Job Title** — Company Name
-📍 Location | ⏳ Experience | ⭐ Rating
+📍 Location | ⏳ Experience | 💰 Pay (if available) | ⭐ Rating (if available)
+🏭 Industry (if available) | 🎓 Education (if available)
 🛠️ `skill1` `skill2` `skill3` `skill4`
 
 Rules for cards:
-- Strictly 3 lines per card, no more
+- Show 💰 Pay and 🏭 Industry only when the data is present — skip those lines if not
 - Keep location short — city names only, max 2-3 cities
-- If rating is missing or None → write N/A
+- If rating/pay is missing → omit that field entirely, don't write N/A
 - Skills in backticks like tags — max 4-5 skills per card
 - Separate each card with a blank line
 - After ALL cards write ONE short summary line (max 20 words)
@@ -753,19 +760,7 @@ TOOLS = {
     "general_advice": {"description": "Answer career questions using LLM knowledge", "params": ["question"]}
 }
 
-# ------------------------------------------------
-# FIXED: apply_multi_role_filter
-# The original code joined conditions with commas inside a single or_() call.
-# Supabase Python client's or_() accepts a single string like "col.ilike.%x%,col.ilike.%y%"
-# which is correct — but only when the column filter is on THE SAME column.
-# The bug was that an empty `role` string still triggered filtering.
-# Also added proper None/empty checks.
-# ------------------------------------------------
 def build_or_filter(column, values):
-    """
-    Build a Supabase or_ filter string for multiple values on one column.
-    Returns None if no valid values.
-    """
     if not values:
         return None
     parts = [f"{column}.ilike.%{v}%" for v in values if v and v.strip()]
@@ -774,7 +769,6 @@ def build_or_filter(column, values):
     return ",".join(parts)
 
 def apply_multi_role_filter(query, column, role_string):
-    """Apply ilike filter for multiple roles/values on a column."""
     if not role_string or not role_string.strip():
         return query
     roles = [r.strip() for r in re.split(r",|or|\||and", role_string, flags=re.I)]
@@ -787,7 +781,6 @@ def apply_multi_role_filter(query, column, role_string):
     return query
 
 def apply_multi_city_filter(query, column, city_string):
-    """Apply ilike filter for multiple cities on a column."""
     if not city_string or not city_string.strip():
         return query
     cities = [c.strip() for c in re.split(r",|or|\|", city_string, flags=re.I)]
@@ -800,7 +793,6 @@ def apply_multi_city_filter(query, column, city_string):
     return query
 
 def apply_multi_company_filter(query, column, company_string):
-    """Apply ilike filter for multiple companies on a column."""
     if not company_string or not company_string.strip():
         return query
     companies = [c.strip() for c in re.split(r",|or|\|", company_string, flags=re.I)]
@@ -811,10 +803,6 @@ def apply_multi_company_filter(query, column, company_string):
     if filter_str:
         return query.or_(filter_str)
     return query
-
-# ------------------------------------------------
-# TOOL FUNCTIONS — Fixed all query functions
-# ------------------------------------------------
 
 def count_jobs_naukri(role="", city="", months=None):
     try:
@@ -873,7 +861,7 @@ def top_skills(role=""):
     try:
         q = supabase.table("naukri_jobs").select("skills")
         q = apply_multi_role_filter(q, "jobtitle", role)
-        res = q.limit(200).execute()  # increased limit for better skill frequency
+        res = q.limit(200).execute()
         freq = {}
         for row in res.data or []:
             skills_raw = row.get("skills") or ""
@@ -910,7 +898,6 @@ def salary_insights(role="", city=""):
         q = apply_multi_role_filter(q, "jobtitle", role)
         q = apply_multi_city_filter(q, "joblocation_address", city)
         res = q.limit(30).execute()
-        # Return all rows; filter those with payrate on the display side
         all_data = res.data or []
         with_salary = [r for r in all_data if r.get("payrate")]
         return {
@@ -1046,7 +1033,6 @@ Respond ONLY with a valid JSON array:
     try:
         response = llm.invoke(plan_prompt)
         content = re.sub(r"```json|```", "", response.content.strip()).strip()
-        # Handle potential trailing text after JSON
         json_match = re.search(r'\[.*\]', content, re.DOTALL)
         if json_match:
             content = json_match.group(0)
@@ -1083,7 +1069,6 @@ def generate_final_answer(user_question, tool_results, chat_history, is_hindi=Fa
         results_str += json.dumps(r["data"], indent=2, default=str)
 
     history_str = build_history_str(chat_history, max_messages=6)
-
     language = "IMPORTANT: Respond entirely in Hindi." if is_hindi else "Respond in English."
 
     answer_prompt = f"""You are an expert career advisor with real Indian job market data.
@@ -1115,22 +1100,27 @@ Instructions:
 # BUILD RAG INDEX ON STARTUP
 # ================================================
 with st.spinner("⏳ Loading RAG index..."):
-    vector_store, result, status = get_vector_store()
+    vector_store, counts, status = get_vector_store()
 
 if vector_store:
-    if status == "created":
-        st.success(f"✅ RAG created and saved! {result} jobs indexed permanently.")
-    elif status == "loaded":
-        st.success(f"✅ RAG loaded instantly! {result} jobs ready.")
+    if status == "loaded_both":
+        st.success(
+            f"✅ RAG ready! "
+            f"{counts['naukri']} naukri jobs + {counts['jobs']} jobs table = "
+            f"**{counts['total']} total** listings indexed."
+        )
+    elif status == "loaded_naukri_only":
+        st.success(f"✅ RAG ready — {counts['naukri']} naukri jobs indexed. (job_static_embeddings empty)")
+    elif status == "loaded_jobs_only":
+        st.success(f"✅ RAG ready — {counts['jobs']} jobs table listings indexed. (naukri embeddings empty)")
 else:
     if status == "no_data":
-        st.error("❌ No data in naukri_jobs table.")
-    elif status == "save_error":
-        st.error(f"❌ Save failed: {result}")
-    elif status == "load_error":
-        st.error(f"❌ Load failed: {result}")
+        st.error("❌ No embeddings found in either job_embeddings or job_static_embeddings.")
     else:
-        st.error(f"❌ RAG failed: {result}")
+        st.error(f"❌ RAG failed: {status}")
+
+# Keep result for welcome message (total count or 0)
+result = counts.get("total", 0) if vector_store else 0
 
 # ================================================
 # DEBUG PANEL
@@ -1163,25 +1153,41 @@ with st.expander("🔧 Debug Panel"):
             except Exception as e:
                 st.error(f"❌ {e}")
     with col4:
+        if st.button("Test static embeddings"):
+            try:
+                res = supabase.table("job_static_embeddings")\
+                    .select("jobid, jobtitle, company, joblocation_address").limit(5).execute()
+                st.success(f"✅ {len(res.data)} static embeddings")
+                if res.data: st.dataframe(res.data)
+            except Exception as e:
+                st.error(f"❌ {e}")
+    with col5:
         if st.button("Test RAG Search"):
             if vector_store:
                 docs = rag_search("python developer bangalore", vector_store)
                 st.success(f"✅ {len(docs)} jobs found")
-                for d in docs[:2]:
+                for d in docs[:3]:
+                    src = d.metadata.get("source", "unknown")
+                    st.caption(f"Source: {src}")
                     st.text(d.page_content[:200])
                     st.divider()
             else:
                 st.error("❌ RAG not ready")
-    with col5:
-        if st.button("🔄 Refresh RAG"):
+
+    col6, col7 = st.columns(2)
+    with col6:
+        if st.button("🔄 Refresh naukri RAG"):
             try:
                 supabase.table("job_embeddings").delete().neq("id", -1).execute()
                 get_vector_store.clear()
-                st.success("✅ Cleared! Refresh page to rebuild.")
+                st.success("✅ Cleared naukri embeddings! Refresh page to rebuild.")
             except Exception as e:
                 st.error(f"❌ {e}")
+    with col7:
+        if st.button("🔄 Refresh combined RAG"):
+            get_vector_store.clear()
+            st.success("✅ Cache cleared! Refresh page to reload both stores.")
 
-    # Extra: test a direct query to debug filter issues
     st.divider()
     st.markdown("**🔬 Test Query Filter**")
     test_role = st.text_input("Test role (e.g. 'data analyst')", key="test_role_input")
@@ -1196,10 +1202,8 @@ with st.expander("🔧 Debug Panel"):
 # CHAT UI
 # ================================================
 
-# ── Initialize messages — load from Supabase on first run only
 if "messages" not in st.session_state:
     history = load_chat_history()
-
     if history:
         st.session_state.messages = history
         st.session_state.history_loaded = True
@@ -1216,32 +1220,26 @@ if "messages" not in st.session_state:
                 "- 💰 **Salary** — *Show salaries for data analysts*\n"
                 "- 🏢 **Companies** — *Jobs at TCS or Infosys*\n"
                 "- 🇮🇳 **Hindi** — *मुझे नौकरी ढूंढने में मदद करो* 🙏\n\n"
-                f"{'✅ RAG Active — ' + str(result) + ' jobs indexed' if vector_store else '⚠️ RAG not available'}"
+                f"{'✅ RAG Active — ' + str(result) + ' total jobs indexed' if vector_store else '⚠️ RAG not available'}"
             )
         }]
         st.session_state.history_loaded = False
 
-# Keep message list from growing unboundedly in session
 if len(st.session_state.messages) > 60:
-    # Keep welcome message + last 40 messages
     st.session_state.messages = (
         st.session_state.messages[:1] + st.session_state.messages[-40:]
     )
 
-# Render all messages
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# ── Chat input
 if prompt := st.chat_input("Ask about jobs, skills, salaries, risk score..."):
 
-    # Add user message to session + display
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
     save_chat("user", prompt)
 
-    # Detect Hindi and translate for processing
     is_hindi = bool(re.search("[\u0900-\u097F]", prompt))
     processing_prompt = translate_to_english(prompt) if is_hindi else prompt
 
@@ -1251,15 +1249,12 @@ if prompt := st.chat_input("Ask about jobs, skills, salaries, risk score..."):
 
     answer = None
 
-    # ── Priority 1: Risk session
     risk_answer = handle_risk_conversation(processing_prompt, is_hindi)
 
     if risk_answer:
         answer = risk_answer
 
-    # ── Priority 2: Casual conversation
     elif is_casual_message(processing_prompt):
-        # Pass recent history so casual replies are context-aware
         history_str = build_history_str(st.session_state.messages[:-1], max_messages=4)
         casual_reply = llm.invoke(
             f"You are a friendly career assistant. Use conversation history for context.\n"
@@ -1267,20 +1262,18 @@ if prompt := st.chat_input("Ask about jobs, skills, salaries, risk score..."):
         ).content
         answer = casual_reply
 
-    # ── Priority 3: RAG — semantic + follow-up
     elif should_use_rag(processing_prompt) and vector_store:
         with st.spinner("🔍 Searching..."):
             rag_response, relevant_docs, rewritten = rag_answer(
                 processing_prompt,
                 vector_store,
-                st.session_state.messages[:-1],  # history excluding current user msg
+                st.session_state.messages[:-1],
                 is_hindi
             )
         if rewritten != processing_prompt:
             st.caption(f"🔄 Searched for: _{rewritten}_")
         answer = rag_response
 
-    # ── Priority 4: Tool calling — structured queries
     else:
         with st.spinner("🧠 Thinking..."):
             tool_calls = plan_tool_call(
@@ -1305,7 +1298,6 @@ if prompt := st.chat_input("Ask about jobs, skills, salaries, risk score..."):
                 is_hindi
             )
 
-    # Save + display assistant answer
     if answer:
         save_chat("assistant", answer)
         st.chat_message("assistant").write(answer)
