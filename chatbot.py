@@ -52,7 +52,6 @@ if "user_id" not in st.session_state:
             st.session_state.user_id = uid
             st.session_state.user_email = email
             st.query_params.clear()
-            st.query_params["embed"] = "true"
             st.rerun()
         except ValueError as e:
             st.error(f"❌ Authentication failed: {e}")
