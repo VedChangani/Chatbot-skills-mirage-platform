@@ -14,6 +14,10 @@ from deep_translator import GoogleTranslator
 # Config
 # ------------------------------------------------
 st.set_page_config(page_title="Career AI", page_icon="💼", layout="centered")
+os.environ['STREAMLIT_SERVER_ENABLE_CORS'] = "false"
+os.environ['STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION'] = "false"
+st.title("💼 Career Intelligence Chatbot")
+st.caption("RAG + Query Rewriting + Tool Calling + Risk Metrics + Hindi Support")
 
 # ------------------------------------------------
 # Credentials
@@ -26,45 +30,59 @@ if not GROQ_API_KEY or not SUPABASE_KEY or not SUPABASE_URL:
     st.error("❌ Missing credentials. Add to Streamlit Secrets.")
     st.stop()
 
-llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama-3.3-70b-versatile")
+# ------------------------------------------------
+# Supabase + LLM clients (must be created BEFORE auth check)
+# ------------------------------------------------
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama-3.3-70b-versatile")
 
-# ================================================
-# SUPABASE AUTH — URL token gate
-# ================================================
+# ------------------------------------------------
+# Auth: get token from URL params and verify user
+# ------------------------------------------------
+query_params = st.query_params
+auth_token = query_params.get("token")
 
-TOKEN_PARAM = "sb_token"
+if not auth_token:
+    st.warning("⌛ No auth token received. Please close and reopen the chatbot panel.")
+    st.info("If this keeps happening, your session may have expired. Try logging out and back in.")
+    st.stop()
 
-def verify_token_and_set_user(access_token: str) -> tuple:
+try:
+    user_response = supabase.auth.get_user(auth_token)
+    current_user_id = user_response.user.id
+except Exception:
+    st.error("❌ Invalid or expired session. Please log in again.")
+    st.stop()
+
+# Store user_id in session state for use across reruns
+st.session_state["user_id"] = current_user_id
+
+# ------------------------------------------------
+# Chat History Persistence
+# ------------------------------------------------
+def load_chat_history(user_id: str, limit: int = 50):
+    """Load the most recent chat messages for this user from Supabase."""
     try:
-        res = supabase.auth.get_user(access_token)
-        if res and res.user:
-            return res.user.id, res.user.email
-        raise ValueError("Token valid but no user returned.")
-    except Exception as e:
-        raise ValueError(f"Token verification failed: {e}")
+        res = supabase.table("chat_history") \
+            .select("role, message, created_at") \
+            .eq("user_id", user_id) \
+            .order("created_at", desc=False) \
+            .limit(limit) \
+            .execute()
+        return [{"role": row["role"], "content": row["message"]} for row in (res.data or [])]
+    except Exception:
+        return []
 
-if "user_id" not in st.session_state:
-    token_from_url = st.query_params.get(TOKEN_PARAM, "").strip()
-    if token_from_url:
-        try:
-            uid, email = verify_token_and_set_user(token_from_url)
-            st.session_state.user_id = uid
-            st.session_state.user_email = email
-            st.query_params.clear()
-            st.rerun()
-        except ValueError as e:
-            st.error(f"❌ Authentication failed: {e}")
-            st.info("Please close this panel and reopen it from the main app.")
-            st.stop()
-    else:
-        st.warning("⏳ No auth token received. Please close and reopen the chatbot panel.")
-        st.info("If this keeps happening, your session may have expired. Try logging out and back in.")
-        st.stop()
-
-# ── Authenticated header ──────────────────────────────────────────────────────
-st.title("💼 Career Intelligence Chatbot")
-st.caption("RAG + Query Rewriting + Tool Calling + Risk Metrics + Hindi Support")
+def save_chat_message(user_id: str, role: str, message: str):
+    """Save a single chat message to Supabase."""
+    try:
+        supabase.table("chat_history").insert({
+            "user_id": user_id,
+            "role": role,
+            "message": message
+        }).execute()
+    except Exception:
+        pass  # Silently fail — don't break chat for a persistence error
 
 # ------------------------------------------------
 # TABLE SCHEMA
@@ -92,69 +110,25 @@ def translate_to_english(text):
         except Exception:
             return text
 
-# ------------------------------------------------
-# SAVING CHAT HISTORY
-# ------------------------------------------------
-def save_chat(role, message):
-    try:
-        supabase.table("chat_history").insert({
-            "user_id": st.session_state.user_id,
-            "role": role,
-            "message": message
-        }).execute()
-    except Exception as e:
-        print("Chat save error:", e)
-
-# ------------------------------------------------
-# LOADING CHAT HISTORY
-# ------------------------------------------------
-def load_chat_history():
-    try:
-        res = supabase.table("chat_history") \
-            .select("role, message, created_at") \
-            .eq("user_id", st.session_state.user_id) \
-            .order("created_at", desc=True) \
-            .limit(20) \
-            .execute()
-        if not res.data:
-            return []
-        data = list(reversed(res.data))
-        return [{"role": r["role"], "content": r["message"]} for r in data]
-    except Exception as e:
-        print("Chat load error:", e)
-        return []
-
-# ------------------------------------------------
-# BUILD HISTORY STRING FOR LLM
-# ------------------------------------------------
-def build_history_str(chat_history, max_messages=10, max_chars_per_msg=600):
-    if not chat_history:
-        return ""
-    history_str = ""
-    recent = chat_history[-max_messages:]
-    for msg in recent:
-        role = "User" if msg["role"] == "user" else "Assistant"
-        content = msg["content"][:max_chars_per_msg]
-        if len(msg["content"]) > max_chars_per_msg:
-            content += "..."
-        history_str += f"{role}: {content}\n"
-    return history_str.strip()
-
 # ================================================
-# RAG SECTION — Dual vector store (naukri_jobs + jobs)
+# RAG SECTION
 # ================================================
 
 @st.cache_resource
 def load_embedding_model():
-    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_community.embeddings import HuggingFaceEmbeddings
     return HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
         model_kwargs={"device": "cpu"}
     )
 
-# ------------------------------------------------
-# naukri_jobs embeddings (table: job_embeddings, pk: id)
-# ------------------------------------------------
+def embeddings_exist():
+    try:
+        res = supabase.table("job_embeddings").select("id").limit(1).execute()
+        return len(res.data) > 0
+    except Exception:
+        return False
+
 def save_embeddings_to_supabase(jobs, embedding_model):
     try:
         existing_ids = set()
@@ -229,7 +203,6 @@ Rating: {job.get('stars', 'N/A')}""".strip()
         return f"Error: {str(e)}"
 
 def load_embeddings_from_supabase(embedding_model):
-    """Load naukri_jobs embeddings from job_embeddings table into a FAISS store."""
     try:
         from langchain_community.vectorstores import FAISS
 
@@ -241,7 +214,7 @@ def load_embeddings_from_supabase(embedding_model):
         chunk_size = 500
         offset = 0
         vector_store = None
-        progress = st.progress(0, text="Loading naukri embeddings...")
+        progress = st.progress(0, text="Loading embeddings from Supabase...")
 
         while offset < total:
             res = supabase.table("job_embeddings").select("*")\
@@ -260,7 +233,6 @@ def load_embeddings_from_supabase(embedding_model):
                 embedding = [float(x) for x in embedding]
                 chunk_text_embeddings.append((row["page_content"], embedding))
                 chunk_metadatas.append({
-                    "source": "naukri_jobs",
                     "jobtitle": row.get("jobtitle", ""),
                     "company": row.get("company", ""),
                     "location": row.get("location", ""),
@@ -284,7 +256,7 @@ def load_embeddings_from_supabase(embedding_model):
             offset += chunk_size
             progress.progress(
                 min(offset / total, 1.0),
-                text=f"Loading naukri... {min(offset, total)}/{total}"
+                text=f"Loading... {min(offset, total)}/{total}"
             )
 
         progress.empty()
@@ -293,162 +265,54 @@ def load_embeddings_from_supabase(embedding_model):
     except Exception as e:
         return None, str(e)
 
-# ------------------------------------------------
-# jobs table embeddings (table: job_static_embeddings, pk: jobid)
-# ------------------------------------------------
-def load_static_embeddings_from_supabase(embedding_model):
-    """Load jobs table embeddings from job_static_embeddings into a FAISS store."""
-    try:
-        from langchain_community.vectorstores import FAISS
-
-        count_res = supabase.table("job_static_embeddings").select("jobid", count="exact").execute()
-        total = count_res.count or 0
-        if total == 0:
-            return None, 0
-
-        chunk_size = 500
-        offset = 0
-        vector_store = None
-        progress = st.progress(0, text="Loading jobs embeddings...")
-
-        while offset < total:
-            res = supabase.table("job_static_embeddings").select("*")\
-                .range(offset, offset + chunk_size - 1).execute()
-            chunk = res.data or []
-            if not chunk:
-                break
-
-            chunk_text_embeddings = []
-            chunk_metadatas = []
-
-            for row in chunk:
-                embedding = row["embedding"]
-                if isinstance(embedding, str):
-                    embedding = json.loads(embedding)
-                embedding = [float(x) for x in embedding]
-                chunk_text_embeddings.append((row["page_content"], embedding))
-                # Include richer metadata from jobs table for display
-                chunk_metadatas.append({
-                    "source": "jobs",
-                    "jobtitle": row.get("jobtitle", ""),
-                    "company": row.get("company", ""),
-                    "location": row.get("joblocation_address", ""),
-                    "skills": row.get("skills", ""),
-                    "industry": row.get("industry", ""),
-                    "payrate": row.get("payrate", ""),
-                    "experience": row.get("experience", ""),
-                    "education": row.get("education", ""),
-                })
-
-            if vector_store is None:
-                vector_store = FAISS.from_embeddings(
-                    text_embeddings=chunk_text_embeddings,
-                    embedding=embedding_model,
-                    metadatas=chunk_metadatas
-                )
-            else:
-                chunk_store = FAISS.from_embeddings(
-                    text_embeddings=chunk_text_embeddings,
-                    embedding=embedding_model,
-                    metadatas=chunk_metadatas
-                )
-                vector_store.merge_from(chunk_store)
-
-            offset += chunk_size
-            progress.progress(
-                min(offset / total, 1.0),
-                text=f"Loading jobs... {min(offset, total)}/{total}"
-            )
-
-        progress.empty()
-        return vector_store, total
-
-    except Exception as e:
-        return None, str(e)
-
-# ------------------------------------------------
-# Combined vector store loader
-# ------------------------------------------------
 @st.cache_resource
 def get_vector_store():
-    """
-    Loads BOTH embedding tables and merges them into a single FAISS index.
-    Returns (merged_vector_store, counts_dict, status_string).
-    """
     try:
         embedding_model = load_embedding_model()
 
-        # ── naukri_jobs side ─────────────────────────────────────────────────
-        total_naukri_res = supabase.table("naukri_jobs").select("id", count="exact").execute()
-        total_naukri = total_naukri_res.count or 0
+        total_res = supabase.table("naukri_jobs").select("id", count="exact").execute()
+        total_jobs = total_res.count or 0
 
-        saved_naukri_res = supabase.table("job_embeddings").select("id", count="exact").execute()
-        total_naukri_saved = saved_naukri_res.count or 0
+        saved_res = supabase.table("job_embeddings").select("id", count="exact").execute()
+        total_saved = saved_res.count or 0
 
-        naukri_store = None
-        naukri_count = 0
+        if total_saved >= total_jobs and total_saved > 0:
+            vector_store, result = load_embeddings_from_supabase(embedding_model)
+            if vector_store:
+                return vector_store, result, "loaded"
 
-        if total_naukri_saved >= total_naukri and total_naukri_saved > 0:
-            # All naukri jobs already embedded — load directly
-            naukri_store, naukri_count = load_embeddings_from_supabase(embedding_model)
+        all_jobs = []
+        page_size = 1000
+        offset = 0
+        while True:
+            res = supabase.table("naukri_jobs").select(
+                "id, jobtitle, company, location, skills, experience, stars"
+            ).range(offset, offset + page_size - 1).execute()
+            batch = res.data or []
+            if not batch:
+                break
+            all_jobs.extend(batch)
+            offset += page_size
+            if len(batch) < page_size:
+                break
+
+        if not all_jobs:
+            return None, 0, "no_data"
+
+        saved = save_embeddings_to_supabase(all_jobs, embedding_model)
+        if isinstance(saved, str):
+            return None, saved, "save_error"
+
+        vector_store, result = load_embeddings_from_supabase(embedding_model)
+        if vector_store:
+            return vector_store, result, "created"
         else:
-            # Some naukri jobs missing — fetch and embed them first
-            all_jobs = []
-            page_size = 1000
-            offset = 0
-            while True:
-                res = supabase.table("naukri_jobs").select(
-                    "id, jobtitle, company, location, skills, experience, stars"
-                ).range(offset, offset + page_size - 1).execute()
-                batch = res.data or []
-                if not batch:
-                    break
-                all_jobs.extend(batch)
-                offset += page_size
-                if len(batch) < page_size:
-                    break
-
-            if all_jobs:
-                saved = save_embeddings_to_supabase(all_jobs, embedding_model)
-                if not isinstance(saved, str):
-                    naukri_store, naukri_count = load_embeddings_from_supabase(embedding_model)
-
-        # ── jobs table (static) side ─────────────────────────────────────────
-        # job_static_embeddings is pre-generated offline (generate_jobs_embeddings.py)
-        # so we only load here — never generate inside the app.
-        static_store = None
-        static_count = 0
-
-        saved_static_res = supabase.table("job_static_embeddings").select("jobid", count="exact").execute()
-        total_static_saved = saved_static_res.count or 0
-
-        if total_static_saved > 0:
-            static_store, static_count = load_static_embeddings_from_supabase(embedding_model)
-
-        # ── Merge both stores ────────────────────────────────────────────────
-        if naukri_store and static_store:
-            # Merge static into naukri (in-place merge, naukri_store becomes combined)
-            naukri_store.merge_from(static_store)
-            combined_count = naukri_count + static_count
-            return naukri_store, {"naukri": naukri_count, "jobs": static_count, "total": combined_count}, "loaded_both"
-
-        elif naukri_store:
-            return naukri_store, {"naukri": naukri_count, "jobs": 0, "total": naukri_count}, "loaded_naukri_only"
-
-        elif static_store:
-            return static_store, {"naukri": 0, "jobs": static_count, "total": static_count}, "loaded_jobs_only"
-
-        else:
-            return None, {"naukri": 0, "jobs": 0, "total": 0}, "no_data"
+            return None, result, "load_error"
 
     except Exception as e:
-        return None, {}, str(e)
+        return None, str(e), "exception"
 
-def rag_search(query, vector_store, k=6):
-    """
-    Search the combined vector store. k=6 so we get a good mix from both sources.
-    Results already have source metadata ("naukri_jobs" or "jobs") set during load.
-    """
+def rag_search(query, vector_store, k=5):
     try:
         return vector_store.similarity_search(query, k=k)
     except Exception:
@@ -461,7 +325,10 @@ def rewrite_query(question, chat_history):
     if not chat_history or len(chat_history) < 2:
         return question
 
-    history_str = build_history_str(chat_history, max_messages=6)
+    history_str = ""
+    for msg in chat_history[-6:]:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        history_str += f"{role}: {msg['content'][:300]}\n"
 
     rewrite_prompt = f"""You are a search query optimizer for a job search engine.
 
@@ -496,7 +363,7 @@ Examples:
         return question
 
 # ------------------------------------------------
-# RAG ANSWER — handles both naukri_jobs and jobs sources
+# RAG ANSWER — compact card format
 # ------------------------------------------------
 def rag_answer(question, vector_store, chat_history, is_hindi=False):
     rewritten_query = rewrite_query(question, chat_history)
@@ -505,12 +372,14 @@ def rag_answer(question, vector_store, chat_history, is_hindi=False):
     context = "\n\n---\n\n".join([doc.page_content for doc in relevant_docs]) \
         if relevant_docs else "No relevant jobs found."
 
-    history_str = build_history_str(chat_history, max_messages=8)
+    history_str = ""
+    for msg in (chat_history or [])[-6:]:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        history_str += f"{role}: {msg['content'][:300]}\n"
+
     language = "IMPORTANT: Respond entirely in Hindi." if is_hindi else "Respond in English."
 
-    prompt = f"""You are an expert career advisor with access to real Indian job market data from two sources:
-- naukri_jobs: Indian job listings with ratings and location data
-- jobs: Detailed listings with salary (payrate), industry, education requirements, and full job descriptions
+    prompt = f"""You are an expert career advisor with access to real Indian job market data.
 
 CONVERSATION HISTORY:
 {history_str}
@@ -518,21 +387,24 @@ CONVERSATION HISTORY:
 ORIGINAL USER QUESTION: {question}
 SEARCH QUERY USED: {rewritten_query}
 
-RELEVANT JOB DATA (via semantic search across both sources):
+RELEVANT JOB DATA (via semantic search):
 {context}
 
 Instructions:
-- Format EACH job as a compact card:
+- Format EACH job as a compact 3-line card exactly like this:
 
 **1. Job Title** — Company Name
-📍 Location | ⏳ Experience | 💰 Pay (if available) | ⭐ Rating (if available)
-🏭 Industry (if available) | 🎓 Education (if available)
+📍 Location | ⏳ Experience | ⭐ Rating
 🛠️ `skill1` `skill2` `skill3` `skill4`
 
+**2. Job Title** — Company Name
+📍 Location | ⏳ Experience | ⭐ Rating
+🛠️ `skill1` `skill2` `skill3`
+
 Rules for cards:
-- Show 💰 Pay and 🏭 Industry only when the data is present — skip those lines if not
+- Strictly 3 lines per card, no more
 - Keep location short — city names only, max 2-3 cities
-- If rating/pay is missing → omit that field entirely, don't write N/A
+- If rating is missing or None → write N/A
 - Skills in backticks like tags — max 4-5 skills per card
 - Separate each card with a blank line
 - After ALL cards write ONE short summary line (max 20 words)
@@ -759,192 +631,119 @@ TOOLS = {
     "general_advice": {"description": "Answer career questions using LLM knowledge", "params": ["question"]}
 }
 
-def build_or_filter(column, values):
-    if not values:
-        return None
-    parts = [f"{column}.ilike.%{v}%" for v in values if v and v.strip()]
-    if not parts:
-        return None
-    return ",".join(parts)
-
-def apply_multi_role_filter(query, column, role_string):
-    if not role_string or not role_string.strip():
-        return query
-    roles = [r.strip() for r in re.split(r",|or|\||and", role_string, flags=re.I)]
-    roles = [r for r in roles if r]
-    if not roles:
-        return query
-    filter_str = build_or_filter(column, roles)
-    if filter_str:
-        return query.or_(filter_str)
-    return query
-
-def apply_multi_city_filter(query, column, city_string):
-    if not city_string or not city_string.strip():
-        return query
-    cities = [c.strip() for c in re.split(r",|or|\|", city_string, flags=re.I)]
-    cities = [c for c in cities if c]
-    if not cities:
-        return query
-    filter_str = build_or_filter(column, cities)
-    if filter_str:
-        return query.or_(filter_str)
-    return query
-
-def apply_multi_company_filter(query, column, company_string):
-    if not company_string or not company_string.strip():
-        return query
-    companies = [c.strip() for c in re.split(r",|or|\|", company_string, flags=re.I)]
-    companies = [c for c in companies if c]
-    if not companies:
-        return query
-    filter_str = build_or_filter(column, companies)
-    if filter_str:
-        return query.or_(filter_str)
-    return query
-
 def count_jobs_naukri(role="", city="", months=None):
     try:
         q = supabase.table("naukri_jobs").select("*", count="exact")
-        q = apply_multi_role_filter(q, "jobtitle", role)
-        q = apply_multi_city_filter(q, "location", city)
+        if role: q = q.ilike("jobtitle", f"%{role}%")
+        if city: q = q.ilike("location", f"%{city}%")
         if months:
             cutoff = datetime.utcnow() - timedelta(days=30 * int(months))
             q = q.gte("postdate", cutoff.strftime("%Y-%m-%dT%H:%M:%S+00:00"))
-        result = q.execute()
-        return {"count": result.count or 0}
+        return {"count": q.execute().count or 0}
     except Exception as e:
-        return {"error": str(e), "count": 0}
+        return {"error": str(e)}
 
 def list_jobs_naukri(role="", city="", months=None, limit=8):
     try:
-        q = supabase.table("naukri_jobs").select(
-            "jobtitle, company, location, skills, experience, stars, posted, postdate"
-        )
-        q = apply_multi_role_filter(q, "jobtitle", role)
-        q = apply_multi_city_filter(q, "location", city)
+        q = supabase.table("naukri_jobs").select("jobtitle, company, location, skills, experience, stars, posted, postdate")
+        if role: q = q.ilike("jobtitle", f"%{role}%")
+        if city: q = q.ilike("location", f"%{city}%")
         if months:
             cutoff = datetime.utcnow() - timedelta(days=30 * int(months))
             q = q.gte("postdate", cutoff.strftime("%Y-%m-%dT%H:%M:%S+00:00"))
-        result = q.limit(int(limit)).execute()
-        return {"jobs": result.data or []}
+        return {"jobs": q.limit(int(limit)).execute().data or []}
     except Exception as e:
-        return {"error": str(e), "jobs": []}
+        return {"error": str(e)}
 
 def count_jobs_secondary(role="", city="", months=None):
     try:
         q = supabase.table("jobs").select("*", count="exact")
-        q = apply_multi_role_filter(q, "jobtitle", role)
-        q = apply_multi_city_filter(q, "joblocation_address", city)
+        if role: q = q.ilike("jobtitle", f"%{role}%")
+        if city: q = q.ilike("joblocation_address", f"%{city}%")
         if months:
             cutoff = datetime.utcnow() - timedelta(days=30 * int(months))
             q = q.gte("postdate", cutoff.strftime("%Y-%m-%d"))
-        result = q.execute()
-        return {"count": result.count or 0}
+        return {"count": q.execute().count or 0}
     except Exception as e:
-        return {"error": str(e), "count": 0}
+        return {"error": str(e)}
 
 def list_jobs_secondary(role="", city="", limit=8):
     try:
-        q = supabase.table("jobs").select(
-            "jobtitle, company, joblocation_address, skills, payrate, experience, industry"
-        )
-        q = apply_multi_role_filter(q, "jobtitle", role)
-        q = apply_multi_city_filter(q, "joblocation_address", city)
-        result = q.limit(int(limit)).execute()
-        return {"jobs": result.data or []}
+        q = supabase.table("jobs").select("jobtitle, company, joblocation_address, skills, payrate, experience, industry")
+        if role: q = q.ilike("jobtitle", f"%{role}%")
+        if city: q = q.ilike("joblocation_address", f"%{city}%")
+        return {"jobs": q.limit(int(limit)).execute().data or []}
     except Exception as e:
-        return {"error": str(e), "jobs": []}
+        return {"error": str(e)}
 
 def top_skills(role=""):
     try:
         q = supabase.table("naukri_jobs").select("skills")
-        q = apply_multi_role_filter(q, "jobtitle", role)
-        res = q.limit(200).execute()
+        if role: q = q.ilike("jobtitle", f"%{role}%")
+        res = q.limit(150).execute()
         freq = {}
         for row in res.data or []:
-            skills_raw = row.get("skills") or ""
-            for s in skills_raw.split(","):
+            for s in (row.get("skills") or "").split(","):
                 s = s.strip()
-                if s:
-                    freq[s] = freq.get(s, 0) + 1
-        top = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:12]
-        return {"skills": top, "total_analyzed": len(res.data or [])}
+                if s: freq[s] = freq.get(s, 0) + 1
+        return {"skills": sorted(freq.items(), key=lambda x: x[1], reverse=True)[:12]}
     except Exception as e:
-        return {"error": str(e), "skills": []}
+        return {"error": str(e)}
 
 def industry_breakdown(role="", city=""):
     try:
         q = supabase.table("jobs").select("industry")
-        q = apply_multi_role_filter(q, "jobtitle", role)
-        q = apply_multi_city_filter(q, "joblocation_address", city)
-        res = q.limit(300).execute()
+        if role: q = q.ilike("jobtitle", f"%{role}%")
+        if city: q = q.ilike("joblocation_address", f"%{city}%")
+        res = q.limit(200).execute()
         freq = {}
         for row in res.data or []:
-            ind = (row.get("industry") or "Unknown").strip()
-            if ind:
-                freq[ind] = freq.get(ind, 0) + 1
-        top = dict(sorted(freq.items(), key=lambda x: x[1], reverse=True)[:8])
-        return {"industries": top, "total_analyzed": len(res.data or [])}
+            ind = row.get("industry") or "Unknown"
+            freq[ind] = freq.get(ind, 0) + 1
+        return {"industries": dict(sorted(freq.items(), key=lambda x: x[1], reverse=True)[:8])}
     except Exception as e:
-        return {"error": str(e), "industries": {}}
+        return {"error": str(e)}
 
 def salary_insights(role="", city=""):
     try:
-        q = supabase.table("jobs").select(
-            "jobtitle, company, payrate, joblocation_address"
-        )
-        q = apply_multi_role_filter(q, "jobtitle", role)
-        q = apply_multi_city_filter(q, "joblocation_address", city)
-        res = q.limit(30).execute()
-        all_data = res.data or []
-        with_salary = [r for r in all_data if r.get("payrate")]
-        return {
-            "salary_data": with_salary,
-            "total_found": len(all_data),
-            "with_salary": len(with_salary)
-        }
+        q = supabase.table("jobs").select("jobtitle, company, payrate, joblocation_address")
+        if role: q = q.ilike("jobtitle", f"%{role}%")
+        if city: q = q.ilike("joblocation_address", f"%{city}%")
+        res = q.limit(20).execute()
+        return {"salary_data": [r for r in (res.data or []) if r.get("payrate")]}
     except Exception as e:
-        return {"error": str(e), "salary_data": []}
+        return {"error": str(e)}
 
 def recent_jobs(months=3, role=""):
     try:
         cutoff = datetime.utcnow() - timedelta(days=30 * int(months))
-        q = supabase.table("naukri_jobs").select(
-            "jobtitle, company, location, postdate, skills, posted"
-        ).gte("postdate", cutoff.strftime("%Y-%m-%dT%H:%M:%S+00:00"))
-        q = apply_multi_role_filter(q, "jobtitle", role)
-        result = q.order("postdate", desc=True).limit(15).execute()
-        return {"jobs": result.data or [], "months": months}
+        q = supabase.table("naukri_jobs").select("jobtitle, company, location, postdate, skills, posted")\
+            .gte("postdate", cutoff.strftime("%Y-%m-%dT%H:%M:%S+00:00"))
+        if role: q = q.ilike("jobtitle", f"%{role}%")
+        return {"jobs": q.limit(15).execute().data or [], "months": months}
     except Exception as e:
-        return {"error": str(e), "jobs": []}
+        return {"error": str(e)}
 
 def company_jobs(company="", role=""):
     try:
-        q = supabase.table("naukri_jobs").select(
-            "jobtitle, company, location, skills, experience, stars, posted"
-        )
-        q = apply_multi_company_filter(q, "company", company)
-        q = apply_multi_role_filter(q, "jobtitle", role)
-        result = q.limit(10).execute()
-        return {"jobs": result.data or []}
+        q = supabase.table("naukri_jobs").select("jobtitle, company, location, skills, experience, stars, posted")
+        if company: q = q.ilike("company", f"%{company}%")
+        if role: q = q.ilike("jobtitle", f"%{role}%")
+        return {"jobs": q.limit(10).execute().data or []}
     except Exception as e:
-        return {"error": str(e), "jobs": []}
+        return {"error": str(e)}
 
 def run_custom_sql(sql=""):
     try:
         if not sql.strip().lower().startswith("select"):
             return {"error": "Only SELECT allowed."}
-        result = supabase.rpc("run_query", {"query": sql}).execute()
-        return {"results": result.data or [], "sql_used": sql}
+        return {"results": supabase.rpc("run_query", {"query": sql}).execute().data or [], "sql_used": sql}
     except Exception as e:
         return {"error": str(e)}
 
 def general_advice(question=""):
     try:
-        response = llm.invoke(
-            f"You are an expert Indian job market career advisor. Answer concisely:\n{question}"
-        )
+        response = llm.invoke(f"You are an expert Indian job market career advisor. Answer concisely:\n{question}")
         return {"answer": response.content}
     except Exception as e:
         return {"error": str(e)}
@@ -973,31 +772,16 @@ def should_use_rag(question):
         "tell me more", "more about", "show me similar",
         "what about", "how about", "other options",
         "मेरे लिए", "मुझे कौन सी", "मेरे skills", "मेरी profile",
-        "और बताओ", "इसके बारे में",
-        "jobs", "openings", "vacancies",
-        "hiring", "positions", "roles",
-        "find job", "search job",
-        "developer job", "analyst job",
-        "engineer job"
+        "और बताओ", "इसके बारे में"
     ]
     return any(signal in question.lower() for signal in rag_signals)
 
-def is_casual_message(text):
-    casual_patterns = [
-        "hi", "hello", "hey", "good morning", "good evening",
-        "how are you", "what's up", "thanks", "thank you",
-        "ok", "okay", "cool", "nice", "great", "hmm",
-        "bye", "goodbye", "see you"
-    ]
-    text_lower = text.lower().strip()
-    if len(text_lower.split()) <= 3:
-        for p in casual_patterns:
-            if p in text_lower:
-                return True
-    return False
-
 def plan_tool_call(user_question, chat_history):
-    history_str = build_history_str(chat_history, max_messages=4)
+    history_str = ""
+    if chat_history:
+        for msg in chat_history[-4:]:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_str += f"{role}: {msg['content'][:200]}\n"
 
     tools_desc = "\n".join([
         f"- {name}: {info['description']} | params: {info['params']}"
@@ -1021,26 +805,21 @@ Rules:
 1. Default to naukri_jobs tools for most queries
 2. Use jobs table for salary/industry/payrate
 3. Use run_custom_sql for complex queries
-4. Use general_advice for career knowledge questions
+4. Use general_advice for career knowledge
 5. Pass limit as integer always
-6. If asking about jobs in a city, include that city in params
-7. Always include role param when a job role is mentioned
 
-Respond ONLY with a valid JSON array:
+Respond ONLY with JSON array:
 [{{"tool": "name", "params": {{}}, "reason": "why"}}]
 """
     try:
         response = llm.invoke(plan_prompt)
         content = re.sub(r"```json|```", "", response.content.strip()).strip()
-        json_match = re.search(r'\[.*\]', content, re.DOTALL)
-        if json_match:
-            content = json_match.group(0)
         tool_calls = json.loads(content)
         if isinstance(tool_calls, dict):
             tool_calls = [tool_calls]
         return tool_calls
-    except Exception as e:
-        return [{"tool": "general_advice", "params": {"question": user_question}, "reason": f"fallback: {e}"}]
+    except Exception:
+        return [{"tool": "general_advice", "params": {"question": user_question}, "reason": "fallback"}]
 
 def execute_tool_calls(tool_calls):
     results = []
@@ -1052,10 +831,7 @@ def execute_tool_calls(tool_calls):
             func = TOOL_FUNCTIONS[tool_name]
             valid_params = inspect.signature(func).parameters.keys()
             filtered = {k: v for k, v in params.items() if k in valid_params}
-            try:
-                data = func(**filtered)
-            except Exception as e:
-                data = {"error": str(e)}
+            data = func(**filtered)
         else:
             data = {"error": f"Unknown tool: {tool_name}"}
         results.append({"tool": tool_name, "reason": reason, "data": data})
@@ -1067,7 +843,11 @@ def generate_final_answer(user_question, tool_results, chat_history, is_hindi=Fa
         results_str += f"\n[Tool: {r['tool']} | Reason: {r['reason']}]\n"
         results_str += json.dumps(r["data"], indent=2, default=str)
 
-    history_str = build_history_str(chat_history, max_messages=6)
+    history_str = ""
+    for msg in (chat_history or [])[-4:]:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        history_str += f"{role}: {msg['content'][:300]}\n"
+
     language = "IMPORTANT: Respond entirely in Hindi." if is_hindi else "Respond in English."
 
     answer_prompt = f"""You are an expert career advisor with real Indian job market data.
@@ -1083,43 +863,37 @@ DATA FROM DATABASE:
 Instructions:
 - Use real data for specific, accurate answers
 - Highlight numbers, companies, skills, trends
-- If data is empty or has errors, answer from general knowledge and mention data was unavailable
+- If data empty, answer from general knowledge
 - Be conversational and concise
 - Use bullet points where helpful
-- Reference previous conversation context when relevant
 - {language}
 """
     try:
         response = llm.invoke(answer_prompt)
         return response.content
     except Exception as e:
-        return f"Error generating answer: {str(e)}"
+        return f"Error: {str(e)}"
 
 # ================================================
 # BUILD RAG INDEX ON STARTUP
 # ================================================
 with st.spinner("⏳ Loading RAG index..."):
-    vector_store, counts, status = get_vector_store()
+    vector_store, result, status = get_vector_store()
 
 if vector_store:
-    if status == "loaded_both":
-        st.success(
-            f"✅ RAG ready! "
-            f"{counts['naukri']} naukri jobs + {counts['jobs']} jobs table = "
-            f"**{counts['total']} total** listings indexed."
-        )
-    elif status == "loaded_naukri_only":
-        st.success(f"✅ RAG ready — {counts['naukri']} naukri jobs indexed. (job_static_embeddings empty)")
-    elif status == "loaded_jobs_only":
-        st.success(f"✅ RAG ready — {counts['jobs']} jobs table listings indexed. (naukri embeddings empty)")
+    if status == "created":
+        st.success(f"✅ RAG created and saved! {result} jobs indexed permanently.")
+    elif status == "loaded":
+        st.success(f"✅ RAG loaded instantly! {result} jobs ready.")
 else:
     if status == "no_data":
-        st.error("❌ No embeddings found in either job_embeddings or job_static_embeddings.")
+        st.error("❌ No data in naukri_jobs table.")
+    elif status == "save_error":
+        st.error(f"❌ Save failed: {result}")
+    elif status == "load_error":
+        st.error(f"❌ Load failed: {result}")
     else:
-        st.error(f"❌ RAG failed: {status}")
-
-# Keep result for welcome message (total count or 0)
-result = counts.get("total", 0) if vector_store else 0
+        st.error(f"❌ RAG failed: {result}")
 
 # ================================================
 # DEBUG PANEL
@@ -1152,82 +926,49 @@ with st.expander("🔧 Debug Panel"):
             except Exception as e:
                 st.error(f"❌ {e}")
     with col4:
-        if st.button("Test static embeddings"):
-            try:
-                res = supabase.table("job_static_embeddings")\
-                    .select("jobid, jobtitle, company, joblocation_address").limit(5).execute()
-                st.success(f"✅ {len(res.data)} static embeddings")
-                if res.data: st.dataframe(res.data)
-            except Exception as e:
-                st.error(f"❌ {e}")
-    with col5:
         if st.button("Test RAG Search"):
             if vector_store:
                 docs = rag_search("python developer bangalore", vector_store)
                 st.success(f"✅ {len(docs)} jobs found")
-                for d in docs[:3]:
-                    src = d.metadata.get("source", "unknown")
-                    st.caption(f"Source: {src}")
+                for d in docs[:2]:
                     st.text(d.page_content[:200])
                     st.divider()
             else:
                 st.error("❌ RAG not ready")
-
-    col6, col7 = st.columns(2)
-    with col6:
-        if st.button("🔄 Refresh naukri RAG"):
+    with col5:
+        if st.button("🔄 Refresh RAG"):
             try:
                 supabase.table("job_embeddings").delete().neq("id", -1).execute()
                 get_vector_store.clear()
-                st.success("✅ Cleared naukri embeddings! Refresh page to rebuild.")
+                st.success("✅ Cleared! Refresh page to rebuild.")
             except Exception as e:
                 st.error(f"❌ {e}")
-    with col7:
-        if st.button("🔄 Refresh combined RAG"):
-            get_vector_store.clear()
-            st.success("✅ Cache cleared! Refresh page to reload both stores.")
-
-    st.divider()
-    st.markdown("**🔬 Test Query Filter**")
-    test_role = st.text_input("Test role (e.g. 'data analyst')", key="test_role_input")
-    test_city = st.text_input("Test city (e.g. 'Mumbai')", key="test_city_input")
-    if st.button("Run Test Query"):
-        r1 = list_jobs_naukri(role=test_role, city=test_city, limit=5)
-        st.json(r1)
-        r2 = count_jobs_naukri(role=test_role, city=test_city)
-        st.write(f"Count: {r2}")
 
 # ================================================
 # CHAT UI
 # ================================================
-
 if "messages" not in st.session_state:
-    history = load_chat_history()
-    if history:
-        st.session_state.messages = history
-        st.session_state.history_loaded = True
+    # Load previous chat history from Supabase for this user
+    saved_messages = load_chat_history(st.session_state["user_id"])
+    greeting = {
+        "role": "assistant",
+        "content": (
+            "👋 Hi! I'm your Career Intelligence Assistant.\n\n"
+            "I can help you with:\n"
+            "- 🔍 **Semantic search** — *Find jobs matching my Python and ML skills*\n"
+            "- 💬 **Follow-ups** — *What about Mumbai? Tell me more about that*\n"
+            "- 📊 **Queries** — *How many BPO jobs in Delhi?*\n"
+            "- 🎯 **Risk score** — *Calculate my AI risk score*\n"
+            "- 💰 **Salary** — *Show salaries for data analysts*\n"
+            "- 🏢 **Companies** — *Jobs at TCS or Infosys*\n"
+            "- 🇮🇳 **Hindi** — *मुझे नौकरी ढूंढने में मदद करो* 🙏\n\n"
+            f"{'✅ RAG Active — ' + str(result) + ' jobs indexed' if vector_store else '⚠️ RAG not available'}"
+        )
+    }
+    if saved_messages:
+        st.session_state.messages = [greeting] + saved_messages
     else:
-        st.session_state.messages = [{
-            "role": "assistant",
-            "content": (
-                "👋 Hi! I'm your Career Intelligence Assistant.\n\n"
-                "I can help you with:\n"
-                "- 🔍 **Semantic search** — *Find jobs matching my Python and ML skills*\n"
-                "- 💬 **Follow-ups** — *What about Mumbai? Tell me more about that*\n"
-                "- 📊 **Queries** — *How many BPO jobs in Delhi?*\n"
-                "- 🎯 **Risk score** — *Calculate my AI risk score*\n"
-                "- 💰 **Salary** — *Show salaries for data analysts*\n"
-                "- 🏢 **Companies** — *Jobs at TCS or Infosys*\n"
-                "- 🇮🇳 **Hindi** — *मुझे नौकरी ढूंढने में मदद करो* 🙏\n\n"
-                f"{'✅ RAG Active — ' + str(result) + ' total jobs indexed' if vector_store else '⚠️ RAG not available'}"
-            )
-        }]
-        st.session_state.history_loaded = False
-
-if len(st.session_state.messages) > 60:
-    st.session_state.messages = (
-        st.session_state.messages[:1] + st.session_state.messages[-40:]
-    )
+        st.session_state.messages = [greeting]
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
@@ -1235,9 +976,8 @@ for msg in st.session_state.messages:
 if prompt := st.chat_input("Ask about jobs, skills, salaries, risk score..."):
 
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    save_chat("user", prompt)
+    st.chat_message("user").write(prompt)
+    save_chat_message(st.session_state["user_id"], "user", prompt)
 
     is_hindi = bool(re.search("[\u0900-\u097F]", prompt))
     processing_prompt = translate_to_english(prompt) if is_hindi else prompt
@@ -1246,39 +986,36 @@ if prompt := st.chat_input("Ask about jobs, skills, salaries, risk score..."):
         with st.sidebar:
             st.info(f"🌐 Translated: *{processing_prompt}*")
 
-    answer = None
-
+    # ── Priority 1: Risk
     risk_answer = handle_risk_conversation(processing_prompt, is_hindi)
 
     if risk_answer:
-        answer = risk_answer
+        st.session_state.messages.append({"role": "assistant", "content": risk_answer})
+        st.chat_message("assistant").write(risk_answer)
+        save_chat_message(st.session_state["user_id"], "assistant", risk_answer)
 
-    elif is_casual_message(processing_prompt):
-        history_str = build_history_str(st.session_state.messages[:-1], max_messages=4)
-        casual_reply = llm.invoke(
-            f"You are a friendly career assistant. Use conversation history for context.\n"
-            f"HISTORY:\n{history_str}\n\nUSER: {processing_prompt}\n\nRespond briefly and naturally:"
-        ).content
-        answer = casual_reply
-
+    # ── Priority 2: RAG — semantic + follow-up
     elif should_use_rag(processing_prompt) and vector_store:
         with st.spinner("🔍 Searching..."):
-            rag_response, relevant_docs, rewritten = rag_answer(
+            answer, relevant_docs, rewritten = rag_answer(
                 processing_prompt,
                 vector_store,
                 st.session_state.messages[:-1],
                 is_hindi
             )
+
+        # Show rewritten query inline if different
         if rewritten != processing_prompt:
             st.caption(f"🔄 Searched for: _{rewritten}_")
-        answer = rag_response
 
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.chat_message("assistant").write(answer)
+        save_chat_message(st.session_state["user_id"], "assistant", answer)
+
+    # ── Priority 3: Tool calling — structured queries
     else:
         with st.spinner("🧠 Thinking..."):
-            tool_calls = plan_tool_call(
-                processing_prompt,
-                st.session_state.messages[:-1]
-            )
+            tool_calls = plan_tool_call(processing_prompt, st.session_state.messages[:-1])
 
             with st.sidebar:
                 st.subheader("🔍 Tool Plan")
@@ -1289,7 +1026,6 @@ if prompt := st.chat_input("Ask about jobs, skills, salaries, risk score..."):
                     st.divider()
 
             tool_results = execute_tool_calls(tool_calls)
-
             answer = generate_final_answer(
                 processing_prompt,
                 tool_results,
@@ -1297,7 +1033,6 @@ if prompt := st.chat_input("Ask about jobs, skills, salaries, risk score..."):
                 is_hindi
             )
 
-    if answer:
-        save_chat("assistant", answer)
-        st.chat_message("assistant").write(answer)
         st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.chat_message("assistant").write(answer)
+        save_chat_message(st.session_state["user_id"], "assistant", answer)
